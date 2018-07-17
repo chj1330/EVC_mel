@@ -6,7 +6,7 @@ from os.path import join
 from datetime import datetime
 from nnmnkwii.datasets import FileSourceDataset, FileDataSource
 from torch.utils.data.sampler import Sampler
-from model import ConvBlock
+from model import EVCModel, NEU2EMO, MEL2LIN
 import time
 import torch
 import argparse
@@ -46,6 +46,9 @@ class TMelSpecDataSource(_NPYDataSource):
     def __init__(self, data_root, data_type):
         super(TMelSpecDataSource, self).__init__(data_root, 2, data_type)
 
+class TLinearSpecDataSource(_NPYDataSource):
+    def __init__(self, data_root, data_type):
+        super(TLinearSpecDataSource, self).__init__(data_root, 0, data_type)
 
 class PartialyRandomizedSimilarTimeLengthSampler(Sampler):
     """Partially randmoized sampler
@@ -95,12 +98,13 @@ class PartialyRandomizedSimilarTimeLengthSampler(Sampler):
 
 
 class PyTorchDataset(object):
-    def __init__(self, S_Mel, T_Mel):
+    def __init__(self, S_Mel, T_Mel, T_Linear):
         self.S_Mel = S_Mel
         self.T_Mel = T_Mel
+        self.T_Linear = T_Linear
 
     def __getitem__(self, idx):
-        return self.S_Mel[idx], self.T_Mel[idx]
+        return self.S_Mel[idx], self.T_Mel[idx], self.T_Linear[idx]
 
     def __len__(self):
         return len(self.T_Mel)
@@ -116,20 +120,23 @@ def collate_fn(batch):
     max_length = max(lengths)
 
     S_Mel = np.array([_pad_2d(x[0], max_length) for x in batch], dtype=np.float32)
-    S_batch = torch.FloatTensor(S_Mel)
+    S_Mbatch = torch.FloatTensor(S_Mel)
 
     T_Mel = np.array([_pad_2d(x[1], max_length) for x in batch], dtype=np.float32)
-    T_batch = torch.FloatTensor(T_Mel)
+    T_Mbatch = torch.FloatTensor(T_Mel)
+
+    T_Linear = np.array([_pad_2d(x[2], max_length) for x in batch], dtype=np.float32)
+    T_Lbatch = torch.FloatTensor(T_Linear)
 
     lengths = torch.LongTensor(lengths)
-    return S_batch, T_batch, lengths
+    return S_Mbatch, T_Mbatch, T_Lbatch, lengths
 
 if __name__ == "__main__":
     GPU_USE = 1
     DEVICE = 'cuda'  # 0 : gpu0, 1 : gpu1, ...
     EPOCH = 20000
     BATCH_SIZE = 16
-    LEARN_RATE = 0.1
+    LEARN_RATE = 0.01
     DATA_ROOT = '../data'
     TARGET = 'Sad'
     #LOG_DIR = join('./log_convAE', TARGET, '{}_lf0'.format(FEAT_TYPE), str(datetime.now()).replace(" ", "_"))
@@ -165,16 +172,18 @@ if __name__ == "__main__":
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     trn_S_Mel = FileSourceDataset(SMelSpecDataSource(TRN_DIR, 'train'))
     trn_T_Mel = FileSourceDataset(TMelSpecDataSource(TRN_DIR, 'train'))
+    trn_T_Linear = FileSourceDataset(TLinearSpecDataSource(TRN_DIR, 'train'))
     val_S_Mel = FileSourceDataset(SMelSpecDataSource(TRN_DIR, 'valid'))
     val_T_Mel = FileSourceDataset(TMelSpecDataSource(TRN_DIR, 'valid'))
+    val_T_Linear = FileSourceDataset(TLinearSpecDataSource(TRN_DIR, 'valid'))
 
     frame_lengths = trn_S_Mel.file_data_source.frame_lengths
 
     sampler = PartialyRandomizedSimilarTimeLengthSampler(frame_lengths, batch_size=args.batch_size)
 
-    train_dataset = PyTorchDataset(trn_S_Mel, trn_T_Mel)
+    train_dataset = PyTorchDataset(trn_S_Mel, trn_T_Mel, trn_T_Linear)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, sampler=sampler, collate_fn=collate_fn, pin_memory=True)
-    valid_dataset = PyTorchDataset(val_S_Mel, val_T_Mel)
+    valid_dataset = PyTorchDataset(val_S_Mel, val_T_Mel, val_T_Linear)
     valid_loader = DataLoader(valid_dataset, batch_size=10, num_workers=args.num_workers, collate_fn=collate_fn)
 
 
@@ -182,12 +191,15 @@ if __name__ == "__main__":
     h = 256  # hidden dim (channels)
     k = 3  # kernel size
     # Initialize
-    model = ConvBlock(in_dim=80, dropout=0.05, preattention=[(h, k, 1), (h, k, 3)],
-        convolutions=[(h, k, 1), (h, k, 3), (h, k, 9), (h, k, 27), (h, k, 1)]).to(device)
 
+    NEU2EMO = NEU2EMO(in_dim=80, dropout=0.05, preattention=[(h, k, 1), (h, k, 3)],
+        convolutions=[(h, k, 1), (h, k, 3), (h, k, 9), (h, k, 27), (h, k, 1)]).to(device)
+    MEL2LIN = MEL2LIN(in_dim=80, out_dim=513, dropout=0.05,
+        convolutions=[(h, k, 1), (h, k, 3), (2 * h, k, 1), (2 * h, k, 3)]).to(device)
+    model = EVCModel(NEU2EMO, MEL2LIN, mel_dim=80, linear_dim=513)
     trainer = Trainer(model=model, train_loader=train_loader, valid_loader=valid_loader, device=device, args=args)
     try:
-        trainer.train()
+        trainer.train(train_seq2seq=True, train_postnet=True)
     except:
         print()
 

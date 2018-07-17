@@ -6,6 +6,8 @@ from tqdm import tqdm
 from lrschedule import noam_learning_rate_decay
 from util import logit, masked_mean, sequence_mask, prepare_spec_image
 import audio
+import numpy as np
+from warnings import warn
 
 class MaskedL1Loss(nn.Module):
     def __init__(self):
@@ -40,6 +42,9 @@ class Trainer:
         self.eval_interval = args.eval_interval
         self.w = args.binary_divergence_weight
         self.epoch = args.epoch
+        self.priority_freq = 3000
+        self.fs = 22050
+        self.linear_dim = 513
 
     def spec_loss(self, y_hat, y, mask, priority_bin=None, priority_w=0):
         masked_l1 = MaskedL1Loss()
@@ -79,10 +84,12 @@ class Trainer:
         return l1_loss, binary_div
 
 
-    def train(self, global_step=0, global_epoch=1):
+    def train(self, train_seq2seq, train_postnet, global_step=0, global_epoch=1):
         while global_epoch < self.epoch:
             running_loss = 0.
-            for step, (melX, melY, lengths) in enumerate(tqdm(self.train_loader)):
+            running_linear_loss = 0.
+            running_mel_loss = 0.
+            for step, (melX, melY, linearY, lengths) in enumerate(tqdm(self.train_loader)):
                 self.model.train()
 
                 # Learn rate scheduler
@@ -92,94 +99,218 @@ class Trainer:
                 self.optimizer.zero_grad()
 
                 # Transform data to CUDA device
-                melX = melX.to(self.device)
+                if train_seq2seq :
+                    melX = melX.to(self.device)
+                if train_postnet :
+                    linearY = linearY.to(self.device)
                 melY = melY.to(self.device)
                 lengths = lengths.to(self.device)
 
                 target_mask = sequence_mask(lengths, max_len=melY.size(1)).unsqueeze(-1)
 
                 # Apply model
-                melX_output = self.model(melX) # TODO : code model
+                if train_seq2seq and train_postnet:
+                    mel_outputs, linear_outputs = self.model(melX, melY) # TODO : code model
+                elif train_seq2seq:
+                    mel_outputs = self.model.seq2seq(melX)
+                    linear_outputs = None
+                elif train_postnet:
+                    linear_outputs = self.model.postnet(melY)
+                    mel_outputs = None
 
                 # Losses
-                mel_l1_loss, mel_binary_div = self.spec_loss(melX_output, melY, target_mask)
-                loss = (1 - self.w) * mel_l1_loss + self.w * mel_binary_div
+                if train_seq2seq:
+                    mel_l1_loss, mel_binary_div = self.spec_loss(mel_outputs, melY, target_mask)
+                    mel_loss = (1 - self.w) * mel_l1_loss + self.w * mel_binary_div
+                if train_postnet:
+                    linear_l1_loss, linear_binary_div = self.spec_loss(linear_outputs, linearY, target_mask)
+                    linear_loss = (1 - self.w) * linear_l1_loss + self.w * linear_binary_div
+
+                # Combine losses
+                if train_seq2seq and train_postnet:
+                    loss = mel_loss + linear_loss
+                elif train_seq2seq:
+                    loss = mel_loss
+                elif train_postnet:
+                    loss = linear_loss
 
                 # Update
                 loss.backward()
                 self.optimizer.step()
                 # Logs
+                if train_seq2seq:
+                    self.writer.add_scalar("mel loss", float(mel_loss.item()), global_step)
+                    self.writer.add_scalar("mel_l1_loss", float(mel_l1_loss.item()), global_step)
+                    self.writer.add_scalar("mel_binary_div_loss", float(mel_binary_div.item()), global_step)
+                if train_postnet:
+                    self.writer.add_scalar("linear_loss", float(linear_loss.item()), global_step)
+                    self.writer.add_scalar("linear_l1_loss", float(linear_l1_loss.item()), global_step)
+                    self.writer.add_scalar("linear_binary_div_loss", float(
+                        linear_binary_div.item()), global_step)
                 self.writer.add_scalar("loss", float(loss.item()), global_step)
-                self.writer.add_scalar("mel_l1_loss", float(mel_l1_loss.item()), global_step)
-                self.writer.add_scalar("mel_binary_div_loss", float(mel_binary_div.item()), global_step)
                 self.writer.add_scalar("learning rate", current_lr, global_step)
 
                 global_step += 1
                 running_loss += loss.item()
+                running_linear_loss += linear_loss.item()
+                running_mel_loss += mel_loss.item()
 
             if (global_epoch % self.checkpoint_interval == 0):
                 self.save_checkpoint(global_step, global_epoch)
             if global_epoch % self.eval_interval == 0:
-                self.save_states(global_epoch, melX_output, melX, melY, lengths)
-            self.eval_model(global_epoch)
+                self.save_states(global_epoch, mel_outputs, linear_outputs, melX, melY, linearY, lengths)
+            self.eval_model(global_epoch, train_seq2seq, train_postnet)
             avg_loss = running_loss / len(self.train_loader)
+            avg_linear_loss = running_linear_loss / len(self.train_loader)
+            avg_mel_loss = running_mel_loss / len(self.train_loader)
             self.writer.add_scalar("train loss (per epoch)", avg_loss, global_epoch)
+            self.writer.add_scalar("train linear loss (per epoch)", avg_linear_loss, global_epoch)
+            self.writer.add_scalar("train mel loss (per epoch)", avg_mel_loss, global_epoch)
             print("Train Loss: {}".format(avg_loss))
             global_epoch += 1
 
 
-    def eval_model(self, global_epoch):
+    def eval_model(self, global_epoch, train_seq2seq, train_postnet):
         running_loss = 0.
-        for step, (melX, melY, lengths) in enumerate(self.valid_loader):
+        running_linear_loss = 0.
+        running_mel_loss = 0.
+        for step, (melX, melY, linearY, lengths) in enumerate(self.valid_loader):
             self.model.eval()
-            melX = melX.to(self.device)
+            if train_seq2seq:
+                melX = melX.to(self.device)
+            if train_postnet:
+                linearY = linearY.to(self.device)
             melY = melY.to(self.device)
             lengths = lengths.to(self.device)
             target_mask = sequence_mask(lengths, max_len=melY.size(1)).unsqueeze(-1)
 
-            melX_outputs = self.model(melX)
+            if train_seq2seq and train_postnet:
+                mel_outputs, linear_outputs = self.model(melX, melY)
+            elif train_seq2seq:
+                mel_outputs = self.model.seq2seq(melX)
+                linear_outputs = None
+            elif train_postnet:
+                linear_outputs = self.model.postnet(melY)
+                mel_outputs = None
 
-            mel_l1_loss, mel_binary_div = self.spec_loss(melX_outputs, melY, target_mask)
-            loss = (1 - self.w) * mel_l1_loss + self.w * mel_binary_div
 
+            # Losses
+            if train_seq2seq:
+                mel_l1_loss, mel_binary_div = self.spec_loss(mel_outputs, melY, target_mask)
+                mel_loss = (1 - self.w) * mel_l1_loss + self.w * mel_binary_div
+            if train_postnet:
+                linear_l1_loss, linear_binary_div = self.spec_loss(linear_outputs, linearY, target_mask)
+                linear_loss = (1 - self.w) * linear_l1_loss + self.w * linear_binary_div
+
+            # Combine losses
+            if train_seq2seq and train_postnet:
+                loss = mel_loss + linear_loss
+            elif train_seq2seq:
+                loss = mel_loss
+            elif train_postnet:
+                loss = linear_loss
             running_loss += loss.item()
+            running_linear_loss += linear_loss.item()
+            running_mel_loss += mel_loss.item()
+
 
         if global_epoch % self.eval_interval == 0:
-            idx = min(1, len(lengths) - 1)
-            mel_output = melX_outputs[idx].cpu().data.numpy()
-            mel_output = prepare_spec_image(audio._denormalize(mel_output))
-            self.writer.add_image("(Eval) Predicted mel spectrogram", mel_output, global_epoch)
+            for idx in range(3):
+                if mel_outputs is not None:
+                    mel_output = mel_outputs[idx].cpu().data.numpy()
+                    mel_output = prepare_spec_image(audio._denormalize(mel_output))
+                    self.writer.add_image("(Eval) Predicted mel spectrogram", mel_output, global_epoch)
+                    melX1 = melX[idx].cpu().data.numpy()
+                    melX1 = prepare_spec_image(audio._denormalize(melX1))
+                    self.writer.add_image("(Eval) Source mel spectrogram", melX1, global_epoch)
+                # Target mel spectrogram
+                melY1 = melY[idx].cpu().data.numpy()
+                melY1 = prepare_spec_image(audio._denormalize(melY1))
+                self.writer.add_image("(Eval) Target mel spectrogram", melY1, global_epoch)
 
-            # Target mel spectrogram
-            melY = melY[idx].cpu().data.numpy()
-            melY = prepare_spec_image(audio._denormalize(melY))
-            self.writer.add_image("(Eval) Target mel spectrogram", melY, global_epoch)
-            melX = melX[idx].cpu().data.numpy()
-            melX = prepare_spec_image(audio._denormalize(melX))
-            self.writer.add_image("(Eval) Source mel spectrogram", melX, global_epoch)
+                if linear_outputs is not None:
+                    linear_output = linear_outputs[idx].cpu().data.numpy()
+                    spectrogram = prepare_spec_image(audio._denormalize(linear_output))
+                    self.writer.add_image("(Eval) Predicted spectrogram", spectrogram, global_epoch)
+                    signal = audio.inv_spectrogram(linear_output.T)
+                    signal /= np.max(np.abs(signal))
+                    path = join(self.args.checkpoint_dir, "epoch{:09d}_{}_predicted.wav".format(global_epoch, idx))
+                    audio.save_wav(signal, path)
+                    try:
+                        self.writer.add_audio("(Eval) Predicted audio signal {}".format(idx), signal, global_epoch, sample_rate=self.fs)
+                    except Exception as e:
+                        warn(str(e))
+                        pass
+                    linearY1 = linearY[idx].cpu().data.numpy()
+                    spectrogram = prepare_spec_image(audio._denormalize(linearY1))
+                    self.writer.add_image("(Eval) Target spectrogram", spectrogram, global_epoch)
+                    signal = audio.inv_spectrogram(linearY1.T)
+                    signal /= np.max(np.abs(signal))
+                    try:
+                        self.writer.add_audio("(Eval) Target audio signal {}".format(idx), signal, global_epoch, sample_rate=self.fs)
+                    except Exception as e:
+                        warn(str(e))
+                        pass
 
         avg_loss = running_loss / len(self.valid_loader)
+        avg_linear_loss = running_linear_loss / len(self.valid_loader)
+        avg_mel_loss = running_mel_loss / len(self.valid_loader)
         self.writer.add_scalar("valid loss (per epoch)", avg_loss, global_epoch)
+        self.writer.add_scalar("valid linear loss (per epoch)", avg_linear_loss, global_epoch)
+        self.writer.add_scalar("valid mel loss (per epoch)", avg_mel_loss, global_epoch)
         print("Valid Loss: {}".format(avg_loss))
 
-    def save_states(self, global_epoch, melX_outputs, melX, melY, lengths):
+
+
+
+    def save_states(self, global_epoch, mel_outputs, linear_outputs, melX, melY, linearY, lengths):
         print("Save intermediate states at epoch {}".format(global_epoch))
 
         # idx = np.random.randint(0, len(input_lengths))
         idx = min(1, len(lengths) - 1)
 
         # Predicted mel spectrogram
-        mel_output = melX_outputs[idx].cpu().data.numpy()
-        mel_output = prepare_spec_image(audio._denormalize(mel_output))
-        self.writer.add_image("Predicted mel spectrogram", mel_output, global_epoch)
+        if mel_outputs is not None:
+            mel_output = mel_outputs[idx].cpu().data.numpy()
+            mel_output = prepare_spec_image(audio._denormalize(mel_output))
+            self.writer.add_image("Predicted mel spectrogram", mel_output, global_epoch)
+        # Predicted spectrogram
+        if linear_outputs is not None:
+            linear_output = linear_outputs[idx].cpu().data.numpy()
+            spectrogram = prepare_spec_image(audio._denormalize(linear_output))
+            self.writer.add_image("Predicted spectrogram", spectrogram, global_epoch)
+            # Predicted audio signal
+            signal = audio.inv_spectrogram(linear_output.T)
+            signal /= np.max(np.abs(signal))
+            path = join(self.args.checkpoint_dir, "epoch{:09d}_predicted.wav".format(global_epoch))
+            try:
+                self.writer.add_audio("Predicted audio signal", signal, global_epoch, sample_rate=self.fs)
+            except Exception as e:
+                warn(str(e))
+                pass
+            audio.save_wav(signal, path)
 
         # Target mel spectrogram
         melY1 = melY[idx].cpu().data.numpy()
         melY1 = prepare_spec_image(audio._denormalize(melY1))
         self.writer.add_image("Target mel spectrogram", melY1, global_epoch)
-        melX1 = melX[idx].cpu().data.numpy()
-        melX1 = prepare_spec_image(audio._denormalize(melX1))
-        self.writer.add_image("Source mel spectrogram", melX1, global_epoch)
+        if mel_outputs is not None:
+            melX1 = melX[idx].cpu().data.numpy()
+            melX1 = prepare_spec_image(audio._denormalize(melX1))
+            self.writer.add_image("Source mel spectrogram", melX1, global_epoch)
+        if linear_outputs is not None:
+            linearY1 = linearY[idx].cpu().data.numpy()
+            spectrogram = prepare_spec_image(audio._denormalize(linearY1))
+            self.writer.add_image("Target spectrogram", spectrogram, global_epoch)
+            # Target audio signal
+            signal = audio.inv_spectrogram(linearY1.T)
+            signal /= np.max(np.abs(signal))
+            try:
+                self.writer.add_audio("Target audio signal", signal, global_epoch, sample_rate=self.fs)
+            except Exception as e:
+                warn(str(e))
+                pass
+
 
 
     def save_checkpoint(self, global_step, global_epoch):
