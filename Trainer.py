@@ -37,7 +37,7 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learn_rate, betas=(0.5, 0.9),
                                           eps=1e-06, weight_decay=0.0, amsgrad=False)
         self.checkpoint_interval = args.checkpoint_inverval
-        self.eval_interval = args.checkpoint_inverval
+        self.eval_interval = args.eval_interval
         self.w = args.binary_divergence_weight
         self.epoch = args.epoch
 
@@ -107,7 +107,7 @@ class Trainer:
 
                 # Update
                 loss.backward()
-
+                self.optimizer.step()
                 # Logs
                 self.writer.add_scalar("loss", float(loss.item()), global_step)
                 self.writer.add_scalar("mel_l1_loss", float(mel_l1_loss.item()), global_step)
@@ -118,9 +118,9 @@ class Trainer:
                 running_loss += loss.item()
 
             if (global_epoch % self.checkpoint_interval == 0):
-                self.save_states(global_epoch, melX_output, melX, melY, lengths)
                 self.save_checkpoint(global_step, global_epoch)
-
+            if global_epoch % self.eval_interval == 0:
+                self.save_states(global_epoch, melX_output, melX, melY, lengths)
             self.eval_model(global_epoch)
             avg_loss = running_loss / len(self.train_loader)
             self.writer.add_scalar("train loss (per epoch)", avg_loss, global_epoch)
@@ -174,12 +174,12 @@ class Trainer:
         self.writer.add_image("Predicted mel spectrogram", mel_output, global_epoch)
 
         # Target mel spectrogram
-        melY = melY[idx].cpu().data.numpy()
-        melY = prepare_spec_image(audio._denormalize(melY))
-        self.writer.add_image("Target mel spectrogram", melY, global_epoch)
-        melX = melX[idx].cpu().data.numpy()
-        melX = prepare_spec_image(audio._denormalize(melX))
-        self.writer.add_image("Source mel spectrogram", melX, global_epoch)
+        melY1 = melY[idx].cpu().data.numpy()
+        melY1 = prepare_spec_image(audio._denormalize(melY1))
+        self.writer.add_image("Target mel spectrogram", melY1, global_epoch)
+        melX1 = melX[idx].cpu().data.numpy()
+        melX1 = prepare_spec_image(audio._denormalize(melX1))
+        self.writer.add_image("Source mel spectrogram", melX1, global_epoch)
 
 
     def save_checkpoint(self, global_step, global_epoch):

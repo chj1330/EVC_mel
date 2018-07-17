@@ -129,7 +129,7 @@ if __name__ == "__main__":
     DEVICE = 'cuda'  # 0 : gpu0, 1 : gpu1, ...
     EPOCH = 20000
     BATCH_SIZE = 16
-    LEARN_RATE = 0.001
+    LEARN_RATE = 0.1
     DATA_ROOT = '../data'
     TARGET = 'Sad'
     #LOG_DIR = join('./log_convAE', TARGET, '{}_lf0'.format(FEAT_TYPE), str(datetime.now()).replace(" ", "_"))
@@ -139,8 +139,8 @@ if __name__ == "__main__":
     NUM_WORKERS = 8
     BINARY_DIVERGENCE_WEIGHT = 0.1
     MASKED_LOSS_WEIGHT = 0.5
-    CHECKPOINT_INTERVAL = 10000 # Save checkpoint
-    EVAL_INTERVAL = 1000 # Plot melspectrogram
+    CHECKPOINT_INTERVAL = 100 # Save checkpoint
+    EVAL_INTERVAL = 100 # Plot melspectrogram
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--log_dir', type=str, default=LOG_DIR, help='log directory')
