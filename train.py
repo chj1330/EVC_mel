@@ -235,7 +235,7 @@ if __name__ == "__main__":
         model, optimizer, global_step, global_epoch = load_checkpoint(checkpoint_path, model, optimizer)
 
     writer = SummaryWriter(log_dir=log_event_path)
-    trainer = Trainer(model, train_loader, valid_loader=valid_loader, optimizer=optimizer, writer=writer, device=device, hparams=hparams)
+    trainer = Trainer(model, train_loader, valid_loader=valid_loader, optimizer=optimizer, writer=writer, checkpoint_dir=checkpoint_dir, device=device, hparams=hparams)
     try:
         trainer.train(train_seq2seq=train_seq2seq, train_postnet=train_postnet, global_epoch=global_epoch, global_step=global_step)
     except:

@@ -28,10 +28,11 @@ class MaskedL1Loss(nn.Module):
         return loss / mask_.sum()
 
 class Trainer:
-    def __init__(self, model, train_loader, valid_loader, optimizer, writer, device, hparams):
+    def __init__(self, model, train_loader, valid_loader, optimizer, writer, checkpoint_dir, device, hparams):
         self.model = model
         self.hparams = hparams
         self.device = device
+        self.checkpoint_dir = checkpoint_dir
         self.train_loader = train_loader
         self.valid_loader = valid_loader
         self.writer = writer
@@ -230,7 +231,7 @@ class Trainer:
                     self.writer.add_image("(Eval) Predicted spectrogram {}".format(idx), spectrogram, global_epoch)
                     signal = audio.inv_spectrogram(linear_output.T)
                     signal /= np.max(np.abs(signal))
-                    path = join(self.args.checkpoint_dir, "epoch{:09d}_{}_predicted.wav".format(global_epoch, idx))
+                    path = join(self.checkpoint_dir, "epoch{:09d}_{}_predicted.wav".format(global_epoch, idx))
                     audio.save_wav(signal, path)
                     try:
                         self.writer.add_audio("(Eval) Predicted audio signal {}".format(idx), signal, global_epoch, sample_rate=self.fs)
@@ -278,7 +279,7 @@ class Trainer:
             # Predicted audio signal
             signal = audio.inv_spectrogram(linear_output.T)
             signal /= np.max(np.abs(signal))
-            path = join(self.args.checkpoint_dir, "epoch{:09d}_predicted.wav".format(global_epoch))
+            path = join(self.checkpoint_dir, "epoch{:09d}_predicted.wav".format(global_epoch))
             try:
                 self.writer.add_audio("Predicted audio signal", signal, global_epoch, sample_rate=self.fs)
             except Exception as e:
@@ -310,7 +311,7 @@ class Trainer:
 
 
     def save_checkpoint(self, global_step, global_epoch):
-        checkpoint_path = join(self.args.checkpoint_dir, "checkpoint_epoch{:09d}.pth".format(global_epoch))
+        checkpoint_path = join(self.checkpoint_dir, "checkpoint_epoch{:09d}.pth".format(global_epoch))
         torch.save({
             "state_dict": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),

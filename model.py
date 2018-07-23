@@ -56,6 +56,7 @@ class NEU2EMO(nn.Module):
         self.preattention = nn.ModuleList()
         in_channels = in_dim
         std_mul = 1.0
+        """
         for out_channels, kernel_size, dilation in preattention:
             if in_channels != out_channels:
                 # Conv1d + ReLU
@@ -87,7 +88,36 @@ class NEU2EMO(nn.Module):
         self.last_conv = Conv1d(in_channels, in_dim, kernel_size=1,
                                 padding=0, dilation=1, std_mul=std_mul,
                                 dropout=dropout)
+        """
+        for out_channels, kernel_size, dilation in preattention:
+            if in_channels != out_channels:
+                # Conv1d + ReLU
+                self.preattention.append(
+                    Conv1d(in_channels, out_channels, kernel_size=1, padding=0,
+                           dilation=1, std_mul=std_mul))
+                self.preattention.append(nn.ReLU(inplace=True))
+                in_channels = out_channels
+                std_mul = 2.0
+            self.preattention.append(
+                Conv1d(in_channels, out_channels, kernel_size=1, padding=0,
+                       dilation=1, dropout=dropout, std_mul=std_mul))
+            in_channels = out_channels
+            std_mul = 4.0
 
+        # Causal convolution blocks + attention layers
+        self.convolutions = nn.ModuleList()
+
+        for i, (out_channels, kernel_size, dilation) in enumerate(convolutions):
+            assert in_channels == out_channels
+            self.convolutions.append(
+                Conv1d(in_channels, out_channels, kernel_size=1, padding=0,
+                          dilation=1, dropout=dropout, std_mul=std_mul))
+            in_channels = out_channels
+            std_mul = 4.0
+        # Last 1x1 convolution
+        self.last_conv = Conv1d(in_channels, in_dim, kernel_size=1,
+                                padding=0, dilation=1, std_mul=std_mul,
+                                dropout=dropout)
     def forward(self, inputs):
         # Grouping multiple frames if necessary
         assert inputs.size(-1) == self.in_dim
