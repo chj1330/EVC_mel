@@ -1,11 +1,13 @@
+# coding: utf-8
+
 from torch import nn
 from modules import Conv1d, Conv1dGLU
 from torch.nn import functional as F
 import math
+
 class EVCModel(nn.Module):
     """Attention seq2seq model + post processing network
     """
-
     def __init__(self, NEU2EMO, MEL2LIN, mel_dim=80, linear_dim=513):
         super(EVCModel, self).__init__()
         self.seq2seq = NEU2EMO
@@ -23,7 +25,7 @@ class EVCModel(nn.Module):
         self.apply(remove_weight_norm)
 
 
-    def forward(self, S_MEL, T_MEL):
+    def forward(self, S_MEL, T_MEL=None):
         # Apply seq2seq
         # (B, T//r, mel_dim*r)
         mel_outputs = self.seq2seq(S_MEL)
@@ -41,8 +43,6 @@ class EVCModel(nn.Module):
         assert linear_outputs.size(-1) == self.linear_dim
 
         return mel_outputs, linear_outputs
-
-
 
 
 

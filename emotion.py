@@ -72,11 +72,10 @@ def _process_utterance(out_dir, in_dir, source_wav_name, target_wav_name, emotio
     t_n_frames = tmel_spectrogram.shape[1]
 
     # Write the spectrograms to disk:
-    #s_spectrogram_filename = 'source-spec-{}.npy'.format(source_wav_name)
     t_spectrogram_filename = 'target-spec-{}.npy'.format(target_wav_name.replace('.wav', ''))
     smel_filename = 'source-mel-{}.npy'.format(source_wav_name.replace('.wav', ''))
     tmel_filename = 'target-mel-{}.npy'.format(target_wav_name.replace('.wav', ''))
-    #np.save(os.path.join(out_dir, s_spectrogram_filename), s_spectrogram.T, allow_pickle=False)
+
     np.save(os.path.join(out_dir, t_spectrogram_filename), t_spectrogram.T, allow_pickle=False)
     np.save(os.path.join(out_dir, smel_filename), smel_spectrogram.T, allow_pickle=False)
     np.save(os.path.join(out_dir, tmel_filename), tmel_spectrogram.T, allow_pickle=False)

@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 from os.path import join
-from tensorboardX import SummaryWriter
 from tqdm import tqdm
 from lrschedule import noam_learning_rate_decay
 from util import logit, masked_mean, sequence_mask, prepare_spec_image
@@ -29,28 +28,25 @@ class MaskedL1Loss(nn.Module):
         return loss / mask_.sum()
 
 class Trainer:
-    def __init__(self, model, train_loader, valid_loader, device, args):
+    def __init__(self, model, train_loader, valid_loader, optimizer, writer, device, hparams):
         self.model = model
-        self.args = args
+        self.hparams = hparams
         self.device = device
         self.train_loader = train_loader
         self.valid_loader = valid_loader
-        self.writer = SummaryWriter(log_dir=args.log_dir)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learn_rate, betas=(0.5, 0.9),
-                                          eps=1e-06, weight_decay=0.0, amsgrad=False)
-        self.checkpoint_interval = args.checkpoint_inverval
-        self.eval_interval = args.eval_interval
-        self.w = args.binary_divergence_weight
-        self.epoch = args.epoch
-        self.priority_freq = 3000
-        self.fs = 22050
-        self.linear_dim = 513
+        self.writer = writer
+        self.optimizer = optimizer
+        self.checkpoint_interval = hparams.checkpoint_interval
+        self.eval_interval = hparams.eval_interval
+        self.w = hparams.binary_divergence_weight
+        self.epoch = hparams.nepochs
+        self.fs = hparams.sample_rate
 
     def spec_loss(self, y_hat, y, mask, priority_bin=None, priority_w=0):
         masked_l1 = MaskedL1Loss()
         l1 = nn.L1Loss()
 
-        w = self.args.masked_loss_weight
+        w = self.hparams.masked_loss_weight
 
         # L1 loss
         if w > 0:
@@ -84,7 +80,7 @@ class Trainer:
         return l1_loss, binary_div
 
 
-    def train(self, train_seq2seq, train_postnet, global_step=0, global_epoch=1):
+    def train(self, train_seq2seq, train_postnet, global_epoch=1, global_step=0):
         while global_epoch < self.epoch:
             running_loss = 0.
             running_linear_loss = 0.
@@ -93,7 +89,7 @@ class Trainer:
                 self.model.train()
 
                 # Learn rate scheduler
-                current_lr = noam_learning_rate_decay(self.args.learn_rate, global_step)
+                current_lr = noam_learning_rate_decay(self.hparams.initial_learning_rate, global_step)
                 for param_group in self.optimizer.param_groups:
                     param_group['lr'] = current_lr
                 self.optimizer.zero_grad()
@@ -103,14 +99,14 @@ class Trainer:
                     melX = melX.to(self.device)
                 if train_postnet :
                     linearY = linearY.to(self.device)
-                melY = melY.to(self.device)
+                    melY = melY.to(self.device)
                 lengths = lengths.to(self.device)
 
-                target_mask = sequence_mask(lengths, max_len=melY.size(1)).unsqueeze(-1)
+                target_mask = sequence_mask(lengths, max_len=melX.size(1)).unsqueeze(-1)
 
                 # Apply model
                 if train_seq2seq and train_postnet:
-                    mel_outputs, linear_outputs = self.model(melX, melY) # TODO : code model
+                    mel_outputs, linear_outputs = self.model(melX) # TODO : code model
                 elif train_seq2seq:
                     mel_outputs = self.model.seq2seq(melX)
                     linear_outputs = None
@@ -215,23 +211,23 @@ class Trainer:
 
 
         if global_epoch % self.eval_interval == 0:
-            for idx in range(3):
+            for idx in range(5):
                 if mel_outputs is not None:
                     mel_output = mel_outputs[idx].cpu().data.numpy()
                     mel_output = prepare_spec_image(audio._denormalize(mel_output))
-                    self.writer.add_image("(Eval) Predicted mel spectrogram", mel_output, global_epoch)
+                    self.writer.add_image("(Eval) Predicted mel spectrogram {}".format(idx), mel_output, global_epoch)
                     melX1 = melX[idx].cpu().data.numpy()
                     melX1 = prepare_spec_image(audio._denormalize(melX1))
-                    self.writer.add_image("(Eval) Source mel spectrogram", melX1, global_epoch)
+                    self.writer.add_image("(Eval) Source mel spectrogram {}".format(idx), melX1, global_epoch)
                 # Target mel spectrogram
                 melY1 = melY[idx].cpu().data.numpy()
                 melY1 = prepare_spec_image(audio._denormalize(melY1))
-                self.writer.add_image("(Eval) Target mel spectrogram", melY1, global_epoch)
+                self.writer.add_image("(Eval) Target mel spectrogram {}".format(idx), melY1, global_epoch)
 
                 if linear_outputs is not None:
                     linear_output = linear_outputs[idx].cpu().data.numpy()
                     spectrogram = prepare_spec_image(audio._denormalize(linear_output))
-                    self.writer.add_image("(Eval) Predicted spectrogram", spectrogram, global_epoch)
+                    self.writer.add_image("(Eval) Predicted spectrogram {}".format(idx), spectrogram, global_epoch)
                     signal = audio.inv_spectrogram(linear_output.T)
                     signal /= np.max(np.abs(signal))
                     path = join(self.args.checkpoint_dir, "epoch{:09d}_{}_predicted.wav".format(global_epoch, idx))
@@ -243,7 +239,7 @@ class Trainer:
                         pass
                     linearY1 = linearY[idx].cpu().data.numpy()
                     spectrogram = prepare_spec_image(audio._denormalize(linearY1))
-                    self.writer.add_image("(Eval) Target spectrogram", spectrogram, global_epoch)
+                    self.writer.add_image("(Eval) Target spectrogram {}".format(idx), spectrogram, global_epoch)
                     signal = audio.inv_spectrogram(linearY1.T)
                     signal /= np.max(np.abs(signal))
                     try:

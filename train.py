@@ -1,3 +1,17 @@
+"""Trainining script for seq2seq emotional conversion model.
+
+usage: train.py [options] <target>
+
+options:
+    --data_root=<dir>            Directory contains preprocessed features [default: ../data].
+    --checkpoint_dir=<dir>       Directory where to save model checkpoints.
+    --checkpoint_path=<path>     Restore model from checkpoint path if given.
+    --log_event_path=<path>      Log event path.
+    --train_dir=<path>           Directory contains preprocessed dtw features.
+    --train-seq2seq-only         Train only seq2seq model.
+    --train-postnet-only         Train only postnet model.
+    -h, --help                   Show this help message and exit
+"""
 import os
 import numpy as np
 from Trainer import Trainer
@@ -7,15 +21,19 @@ from datetime import datetime
 from nnmnkwii.datasets import FileSourceDataset, FileDataSource
 from torch.utils.data.sampler import Sampler
 from model import EVCModel, NEU2EMO, MEL2LIN
-import time
+from docopt import docopt
 import torch
-import argparse
-from model import *
+from hparams import hparams
+from tensorboardX import SummaryWriter
 import random
 import torch.backends.cudnn as cudnn
+
 use_cuda = torch.cuda.is_available()
 if use_cuda:
     cudnn.benchmark = False
+
+global_step = 0
+global_epoch = 1
 
 class _NPYDataSource(FileDataSource):
     def __init__(self, train_dir, col, data_type):
@@ -131,75 +149,95 @@ def collate_fn(batch):
     lengths = torch.LongTensor(lengths)
     return S_Mbatch, T_Mbatch, T_Lbatch, lengths
 
+
+def load_checkpoint(path, model, optimizer):
+    print("Load checkpoint from: {}".format(path))
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint["state_dict"])
+
+    #optimizer_state = checkpoint["optimizer"]
+    print("Load optimizer state from {}".format(path))
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    global_step = checkpoint["global_step"]
+    global_epoch = checkpoint["global_epoch"]
+
+    return model, optimizer, global_step, global_epoch
+
+def build_model(train_seq2seq, train_postnet, device, hparams):
+    h_c = hparams.converter_channels
+    h_p = hparams.postnet_channels
+    k = hparams.kernel_size
+    out_dim = int(hparams.fft_size / 2 + 1)
+    if train_seq2seq:
+        seq2seq = NEU2EMO(in_dim=hparams.num_mels, dropout=hparams.dropout, preattention=[(h_c, k, 1), (h_c, k, 3)],
+            convolutions=[(h_c, k, 1), (h_c, k, 3), (h_c, k, 9), (h_c, k, 27), (h_c, k, 1)]).to(device)
+    if train_postnet:
+        postnet = MEL2LIN(in_dim=hparams.num_mels, out_dim=out_dim, dropout=hparams.dropout,
+            convolutions=[(h_p, k, 1), (h_p, k, 3), (2 * h_p, k, 1), (2 * h_p, k, 3)]).to(device)
+    model = EVCModel(seq2seq, postnet, mel_dim=hparams.num_mels, linear_dim=out_dim)
+    return model
+
 if __name__ == "__main__":
-    GPU_USE = 1
-    DEVICE = 'cuda'  # 0 : gpu0, 1 : gpu1, ...
-    EPOCH = 20000
-    BATCH_SIZE = 16
-    LEARN_RATE = 0.01
-    DATA_ROOT = '../data'
-    TARGET = 'Sad'
-    #LOG_DIR = join('./log_convAE', TARGET, '{}_lf0'.format(FEAT_TYPE), str(datetime.now()).replace(" ", "_"))
-    LOG_DIR = join('./log', TARGET, str(datetime.now()).replace(" ", "_"))
-    TRN_DIR = join(DATA_ROOT, 'dtw_{}'.format(TARGET))  # ./data/dtw_Sad
-    CHECKPOINT_DIR = join('./checkpoint', TARGET, str(datetime.now()).replace(" ", "_"))
-    NUM_WORKERS = 8
-    BINARY_DIVERGENCE_WEIGHT = 0.1
-    MASKED_LOSS_WEIGHT = 0.5
-    CHECKPOINT_INTERVAL = 100 # Save checkpoint
-    EVAL_INTERVAL = 100 # Plot melspectrogram
+    args = docopt(__doc__)
+    print("Command line args:\n", args)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--log_dir', type=str, default=LOG_DIR, help='log directory')
-    parser.add_argument('--checkpoint_dir', type=str, default=CHECKPOINT_DIR, help='checkpoint directory')
-    parser.add_argument('--device', type=str, default=DEVICE, help='which device?')
-    parser.add_argument('--gpu_use', type=int, default=GPU_USE, help='GPU enable? 0 : cpu, 1 : gpu')
-    parser.add_argument('--num_workers', type=int, default=NUM_WORKERS, help='how many workers?')
-    parser.add_argument('--epoch', type=int, default=EPOCH, help='how many epoch?')
-    parser.add_argument('--checkpoint_inverval', type=int, default=CHECKPOINT_INTERVAL, help='checkpoint interval')
-    parser.add_argument('--batch_size', type=int, default=BATCH_SIZE, help='how many batch?')
-    parser.add_argument('--learn_rate', type=float, default=LEARN_RATE, help='learning rate')
-    parser.add_argument('--binary_divergence_weight', type=float, default=BINARY_DIVERGENCE_WEIGHT, help='binary divergence weight')
-    parser.add_argument('--masked_loss_weight', type=float, default=MASKED_LOSS_WEIGHT, help='masked loss weight')
-    parser.add_argument('--eval_interval', type=float, default=EVAL_INTERVAL, help='eval interval')
-    parser.add_argument('--data_root', type=str, default=DATA_ROOT, help='data directory')
-    parser.add_argument('--target', type=str, default=TARGET, help='target emotion')
-    parser.add_argument('--train_dir', type=str, default=TRN_DIR, help='training data directory')
+    target = args["<target>"]
+    data_root = args["--data_root"]
+    checkpoint_dir = args["--checkpoint_dir"]
+    checkpoint_path = args["--checkpoint_path"]
+    log_event_path = args["--log_event_path"]
+    train_dir = args["--train_dir"]
+    # Which model to be trained
+    train_seq2seq = args["--train-seq2seq-only"]
+    train_postnet = args["--train-postnet-only"]
+    # train both if not specified
+    if not train_seq2seq and not train_postnet:
+        print("Training whole model")
+        train_seq2seq, train_postnet = True, True
+    if train_seq2seq:
+        print("Training seq2seq model")
+    elif train_postnet:
+        print("Training postnet model")
+    else:
+        assert False, "must be specified wrong args"
 
-    args = parser.parse_args()
+    if log_event_path is None:
+        log_event_path = join('./log', target, str(datetime.now()).replace(" ", "_"))
+        os.makedirs(log_event_path, exist_ok=True)
+    if checkpoint_dir is None:
+        checkpoint_dir = join('./checkpoint', target, str(datetime.now()).replace(" ", "_"))
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    if train_dir is None:
+        train_dir = join(data_root, 'dtw_{}'.format(target))  # ./data/dtw_Sad
 
-    os.makedirs(args.log_dir, exist_ok=True)
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    trn_S_Mel = FileSourceDataset(SMelSpecDataSource(TRN_DIR, 'train'))
-    trn_T_Mel = FileSourceDataset(TMelSpecDataSource(TRN_DIR, 'train'))
-    trn_T_Linear = FileSourceDataset(TLinearSpecDataSource(TRN_DIR, 'train'))
-    val_S_Mel = FileSourceDataset(SMelSpecDataSource(TRN_DIR, 'valid'))
-    val_T_Mel = FileSourceDataset(TMelSpecDataSource(TRN_DIR, 'valid'))
-    val_T_Linear = FileSourceDataset(TLinearSpecDataSource(TRN_DIR, 'valid'))
+    trn_S_Mel = FileSourceDataset(SMelSpecDataSource(train_dir, 'train'))
+    trn_T_Mel = FileSourceDataset(TMelSpecDataSource(train_dir, 'train'))
+    trn_T_Linear = FileSourceDataset(TLinearSpecDataSource(train_dir, 'train'))
+    val_S_Mel = FileSourceDataset(SMelSpecDataSource(train_dir, 'valid'))
+    val_T_Mel = FileSourceDataset(TMelSpecDataSource(train_dir, 'valid'))
+    val_T_Linear = FileSourceDataset(TLinearSpecDataSource(train_dir, 'valid'))
 
     frame_lengths = trn_S_Mel.file_data_source.frame_lengths
 
-    sampler = PartialyRandomizedSimilarTimeLengthSampler(frame_lengths, batch_size=args.batch_size)
+    sampler = PartialyRandomizedSimilarTimeLengthSampler(frame_lengths, batch_size=hparams.batch_size)
 
     train_dataset = PyTorchDataset(trn_S_Mel, trn_T_Mel, trn_T_Linear)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers, sampler=sampler, collate_fn=collate_fn, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=hparams.batch_size, num_workers=hparams.num_workers, sampler=sampler, collate_fn=collate_fn, pin_memory=True)
     valid_dataset = PyTorchDataset(val_S_Mel, val_T_Mel, val_T_Linear)
-    valid_loader = DataLoader(valid_dataset, batch_size=10, num_workers=args.num_workers, collate_fn=collate_fn)
+    valid_loader = DataLoader(valid_dataset, batch_size=10, num_workers=hparams.num_workers, collate_fn=collate_fn)
 
 
-    device = torch.device("cuda" if args.gpu_use else "cpu")
-    h = 256  # hidden dim (channels)
-    k = 3  # kernel size
-    # Initialize
+    device = torch.device("cuda" if use_cuda else "cpu")
+    model = build_model(train_seq2seq, train_postnet, device, hparams)
+    optimizer = torch.optim.Adam(model.parameters(), lr=hparams.initial_learning_rate, betas=(hparams.adam_beta1, hparams.adam_beta2),
+                                 eps=hparams.adam_eps, weight_decay=hparams.weight_decay, amsgrad=False)
+    if checkpoint_path is not None:
+        model, optimizer, global_step, global_epoch = load_checkpoint(checkpoint_path, model, optimizer)
 
-    NEU2EMO = NEU2EMO(in_dim=80, dropout=0.05, preattention=[(h, k, 1), (h, k, 3)],
-        convolutions=[(h, k, 1), (h, k, 3), (h, k, 9), (h, k, 27), (h, k, 1)]).to(device)
-    MEL2LIN = MEL2LIN(in_dim=80, out_dim=513, dropout=0.05,
-        convolutions=[(h, k, 1), (h, k, 3), (2 * h, k, 1), (2 * h, k, 3)]).to(device)
-    model = EVCModel(NEU2EMO, MEL2LIN, mel_dim=80, linear_dim=513)
-    trainer = Trainer(model=model, train_loader=train_loader, valid_loader=valid_loader, device=device, args=args)
+    writer = SummaryWriter(log_dir=log_event_path)
+    trainer = Trainer(model, train_loader, valid_loader=valid_loader, optimizer=optimizer, writer=writer, device=device, hparams=hparams)
     try:
-        trainer.train(train_seq2seq=True, train_postnet=True)
+        trainer.train(train_seq2seq=train_seq2seq, train_postnet=train_postnet, global_epoch=global_epoch, global_step=global_step)
     except:
         print()
 
